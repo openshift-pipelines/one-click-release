@@ -1,14 +1,20 @@
+#!/usr/bin/env bash
+
+VERSION=${1:-1.21}
+ENVIRONMENT=${2:-devel}
+NEW_PATCH=${3:-false}
 
 #Create Task
 oc apply -f tasks -f pipelines
 
 
-tkn pipeline start konflux-release-pipeline \
+tkn pipeline start konflux-release \
   --serviceaccount=gh-action \
-  --param RELEASE=1.21 \
-  --param ENVIRONMENT=stage \
-  --param TAG=v1.21.2-test \
+  --param VERSION=$VERSION \
+  --param NEW_PATCH=$NEW_PATCH \
+  --param ENVIRONMENT=$ENVIRONMENT \
   --use-param-defaults \
+  -w name=source,emptyDir="" \
   --showlog
 
 #tkn task start konflux-release-task \
