@@ -2,7 +2,7 @@
 apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
-  name: konflux-release
+  name: one-click-release
   annotations:
     tekton.dev/tags: release
 spec:
@@ -43,7 +43,6 @@ spec:
           value: $(params.VERSION)
         - name: NEW_PATCH
           value: $(params.NEW_PATCH)
-
     - name: process-pull-requests
       runAfter:
         - configure-release
@@ -58,7 +57,20 @@ spec:
           value: my-github-secret
         - name: github-token-key
           value: token
-
+    - name: wait-for-core-snapshot
+      runAfter:
+        - process-pull-requests
+      taskRef:
+        name: wait-for-snapshot
+      params:
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: APP
+          value: core
+        - name: github-token-secret
+          value: my-github-secret
+        - name: github-token-key
+          value: token
     - name: release-core
       when:
         - input: $(params.ENVIRONMENT)
@@ -67,7 +79,7 @@ spec:
             - "stage"
             - "prod"
       runAfter:
-        - process-pull-requests
+        - wait-for-core-snapshot
       taskRef:
         name: konflux-release-task
       params:
@@ -77,7 +89,20 @@ spec:
           value: $(params.ENVIRONMENT)
         - name: VERSION
           value: $(params.VERSION)
-
+    - name: process-nudge-prs
+      runAfter:
+        - wait-for-core-snapshot
+      taskRef:
+        name: osp-github-pr-processor
+      params:
+        - name: SEARCH_LABEL
+          value: "konflux-nudge"
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: github-token-secret
+          value: my-github-secret
+        - name: github-token-key
+          value: token
     - name: release-bundle
       when:
         - input: $(params.ENVIRONMENT)
@@ -86,6 +111,7 @@ spec:
             - "stage"
             - "prod"
       runAfter:
+        - process-nudge-prs
         - release-core
       taskRef:
         name: konflux-release-task
@@ -96,6 +122,20 @@ spec:
           value: $(params.ENVIRONMENT)
         - name: VERSION
           value: $(params.VERSION)
+    - name: wait-for-fbc-snapshot
+      runAfter:
+        - release-bundle
+      taskRef:
+        name: wait-for-snapshot
+      params:
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: APP
+          value: index
+        - name: github-token-secret
+          value: my-github-secret
+        - name: github-token-key
+          value: token
     - name: release-fbc
       when:
         - input: $(params.ENVIRONMENT)
@@ -104,12 +144,12 @@ spec:
             - "stage"
             - "prod"
       runAfter:
-        - release-bundle
+        - wait-for-fbc-snapshot
       matrix:
         params:
-        - name: APPLICATION
-          value:
-            - $(params.OCP_VERSIONS)
+          - name: APPLICATION
+            value:
+              - $(params.OCP_VERSIONS)
       params:
         - name: ENVIRONMENT
           value: $(params.ENVIRONMENT)

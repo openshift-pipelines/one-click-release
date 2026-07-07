@@ -8,14 +8,14 @@ NEW_PATCH=${3:-false}
 oc apply -f tasks -f pipelines
 
 
-tkn pipeline start konflux-release \
+tkn pipeline start one-click-release \
+  --prefix-name=one-click-release-${VERSION/./-}-$ENVIRONMENT \
   --serviceaccount=gh-action \
   --param VERSION=$VERSION \
   --param NEW_PATCH=$NEW_PATCH \
   --param ENVIRONMENT=$ENVIRONMENT \
   --use-param-defaults \
-  -w name=source,emptyDir="" \
-  --showlog
+  -w name=source,emptyDir=""
 
 #tkn task start konflux-release-task \
 #  --serviceaccount=gh-action \

@@ -106,11 +106,6 @@ spec:
 
 
     - name: generate-konflux-config
-      when:
-        - input: $(params.NEW_PATCH)
-          operator: in
-          values:
-            - "true"
       description: |
         Generate Konflux Config from Hack Repo
       env:
@@ -119,6 +114,7 @@ spec:
       script: |
         gh auth setup-git
         cd repo
+        rm -rf .konflux/openshift-pipelines/${VERSION//./-} 
         go run ./cmd/konflux --version=$VERSION --dry-run=$(params.DRY_RUN) --generate-tekton=false
 
     - name: commit-new-changes
@@ -127,11 +123,6 @@ spec:
           operator: in
           values:
             - "false"
-        - input: $(params.NEW_PATCH)
-          operator: in
-          values:
-            - "true"
-
       script: |
         # 1. Set the Git identity for this workspace
         cd repo
@@ -164,11 +155,6 @@ spec:
       script: |
         kubectl apply -Rf  ./repo/.konflux/openshift-pipelines/${VERSION/./-}
     - name: generate-tekton-config
-      when:
-        - input: $(params.NEW_PATCH)
-          operator: in
-          values:
-            - "true"
       description: |
         Generate Konflux Config from Hack Repo
       env:
