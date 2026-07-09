@@ -2,63 +2,48 @@
 apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
-  name: openshift-pipelines-release
+  name: one-click-release
   annotations:
     tekton.dev/tags: release
 spec:
   workspaces:
     - name: source
   params:
-    - name: RELEASE
-      default: "1.22"
+    - name: VERSION
     - name: NEW_PATCH
       default: "false"
-    - name: RELEASE_ACTION
-      default: ""
-    - name: TAG
-      default: "v1.22.2"
     - name: ENVIRONMENT
       type: string
-      default: "stage"
-    - name: INDEX_APPLICATIONS
+      default: "devel"
+    - name: OCP_VERSIONS
       default:
-        - openshift-pipelines-index-4-14
-        - openshift-pipelines-index-4-16
-        - openshift-pipelines-index-4-17
-        - openshift-pipelines-index-4-18
-        - openshift-pipelines-index-4-19
-        - openshift-pipelines-index-4-20
-        - openshift-pipelines-index-4-21
-        - openshift-pipelines-index-4-22
-        - openshift-pipelines-index-4-23
-        - openshift-pipelines-index-5-0
-    - name: REBUILD_COMPONENTS
-      default: [ "" ]
+        - 4-14
+        - 4-16
+        - 4-18
+        - 4-19
+        - 4-20
+        - 4-21
+        - 4-22
+        - 4-23
+        - 5-0
   tasks:
     - name: configure-release
+      when:
+        - input: $(params.NEW_PATCH)
+          operator: in
+          values:
+            - "true"
       workspaces:
         - workspace: source
           name: source
       taskRef:
         name: release-config-task
       params:
-        - name: RELEASE
-          value: $(params.RELEASE)
-        - name: RELEASE_ACTION
-          value: $(params.RELEASE_ACTION)
-
-#    - name: process-hack-pull-requests
-#      runAfter:
-#        - configure-release
-#      taskRef:
-#        name: osp-github-pr-processor
-#      params:
-#        - name: SEARCH_LABEL
-#          value: "hack"
-#        - name: RELEASE
-#          value: $(params.RELEASE)
-
-    - name: apply-konflux-configuration
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: NEW_PATCH
+          value: $(params.NEW_PATCH)
+    - name: process-pull-requests
       runAfter:
         - configure-release
       taskRef:
@@ -66,52 +51,110 @@ spec:
       params:
         - name: SEARCH_LABEL
           value: "hack"
-        - name: RELEASE
-          value: $(params.RELEASE)
-
-
-#        - name: release-core
-#          taskRef:
-#            name: konflux-release-task
-#          params:
-#            - name: APPLICATION
-#              value: openshift-pipelines-core
-#            - name: ENVIRONMENT
-#              value: $(params.ENVIRONMENT)
-#            - name: RELEASE
-#              value: $(params.RELEASE)
-#            - name: TAG
-#              value: $(params.TAG)
-
-#    - name: release-bundle
-##      runAfter:
-##        - release-core
-#      taskRef:
-#        name: konflux-release-task
-#      params:
-#        - name: APPLICATION
-#          value: openshift-pipelines-bundle
-#        - name: ENVIRONMENT
-#          value: $(params.ENVIRONMENT)
-#        - name: RELEASE
-#          value: $(params.RELEASE)
-#        - name: TAG
-#          value: $(params.TAG)
-#    - name: release-index
-#      #      runAfter:
-#      #        - release-bundle
-#      matrix:
-#        params:
-#          - name: APPLICATION
-#            value:
-#              - $(params.INDEX_APPLICATIONS)
-#      params:
-#        - name: ENVIRONMENT
-#          value: $(params.ENVIRONMENT)
-#        - name: RELEASE
-#          value: $(params.RELEASE)
-#        - name: TAG
-#          value: $(params.TAG)
-#      taskRef:
-#        name: konflux-release-task
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: github-token-secret
+          value: my-github-secret
+        - name: github-token-key
+          value: token
+    - name: wait-for-core-snapshot
+      runAfter:
+        - process-pull-requests
+      taskRef:
+        name: wait-for-snapshot
+      params:
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: APP
+          value: core
+        - name: github-token-secret
+          value: my-github-secret
+        - name: github-token-key
+          value: token
+    - name: release-core
+      when:
+        - input: $(params.ENVIRONMENT)
+          operator: in
+          values:
+            - "stage"
+            - "prod"
+      runAfter:
+        - wait-for-core-snapshot
+      taskRef:
+        name: konflux-release-task
+      params:
+        - name: APPLICATION
+          value: core
+        - name: ENVIRONMENT
+          value: $(params.ENVIRONMENT)
+        - name: VERSION
+          value: $(params.VERSION)
+    - name: process-nudge-prs
+      runAfter:
+        - wait-for-core-snapshot
+      taskRef:
+        name: osp-github-pr-processor
+      params:
+        - name: SEARCH_LABEL
+          value: "konflux-nudge"
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: github-token-secret
+          value: my-github-secret
+        - name: github-token-key
+          value: token
+    - name: release-bundle
+      when:
+        - input: $(params.ENVIRONMENT)
+          operator: in
+          values:
+            - "stage"
+            - "prod"
+      runAfter:
+        - process-nudge-prs
+        - release-core
+      taskRef:
+        name: konflux-release-task
+      params:
+        - name: APPLICATION
+          value: bundle
+        - name: ENVIRONMENT
+          value: $(params.ENVIRONMENT)
+        - name: VERSION
+          value: $(params.VERSION)
+    - name: wait-for-fbc-snapshot
+      runAfter:
+        - release-bundle
+      taskRef:
+        name: wait-for-snapshot
+      params:
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: APP
+          value: index
+        - name: github-token-secret
+          value: my-github-secret
+        - name: github-token-key
+          value: token
+    - name: release-fbc
+      when:
+        - input: $(params.ENVIRONMENT)
+          operator: in
+          values:
+            - "stage"
+            - "prod"
+      runAfter:
+        - wait-for-fbc-snapshot
+      matrix:
+        params:
+          - name: APPLICATION
+            value:
+              - $(params.OCP_VERSIONS)
+      params:
+        - name: ENVIRONMENT
+          value: $(params.ENVIRONMENT)
+        - name: VERSION
+          value: $(params.VERSION)
+      taskRef:
+        name: konflux-release-task
 
