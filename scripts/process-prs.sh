@@ -59,8 +59,11 @@
             gh pr edit "$URL" --add-label "$LABELS_TO_ADD"
 
             # --- SCENARIO 4: WORKFLOWS FAILING/PENDING ---
-            echo "⏳ Checking workflows..."
-            CHECKS_JSON=$(gh pr checks "$URL" --json name,bucket,link 2>&1 | grep -v "no checks reported" || true)
+            echo "⏳ Checking PR workflows..."
+            CHECKS_JSON=$(gh pr checks "$URL" --json name,bucket,link  | jq -r '.[]
+              | select(.name | test("pull"))
+              | select (.bucket=="pending" or .bucket =="fail")' 2>&1 \
+              | grep -v "no checks reported" || true)
             if [[ -n "$CHECKS_JSON" ]]; then
               FAILING_COUNT=$(echo "$CHECKS_JSON" | jq '[.[] | select(.bucket == "fail")] | length')
               if [[ "$FAILING_COUNT" -gt 0 ]]; then

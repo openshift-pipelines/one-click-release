@@ -123,7 +123,10 @@ verify_snapshot() {
         IFS='|' read -r repo_path commit_sha <<< "$data"
         repo_name=$(basename "$repo_path")
 
-        active_checks=$(gh api "repos/$repo_path/commits/$commit_sha/check-runs" -q '[.check_runs[] | select(.status == "queued" or .status == "in_progress")] | length' 2>/dev/null || echo "0")
+        active_checks=$(gh api "repos/$repo_path/commits/$commit_sha/check-runs" -q \
+          '[.check_runs[]
+            | select((.name | test("push")) or (.app.slug == "github-actions"))
+            | select(.status == "queued" or .status == "in_progress")] | length' 2>/dev/null || echo "0")
         active_statuses=$(gh api "repos/$repo_path/commits/$commit_sha/status" -q '[.statuses[] | select(.state == "pending")] | length' 2>/dev/null || echo "0")
         total_active=$((active_checks + active_statuses))
 
@@ -131,7 +134,7 @@ verify_snapshot() {
             commit_sha=$(rebuild_repo $repo_path)
             mismatched_data+=("$repo_path|$commit_sha")
         else
-            echo "   🔄 $repo_name: Pipelines already running. (Rebuild Skipped)"
+            echo "   🔄 $repo_name: $total_active checks are already running. (Rebuild Skipped)"
         fi
     done
 
@@ -147,7 +150,11 @@ verify_snapshot() {
         pending_checks=0
         for data in "${mismatched_data[@]}"; do
             IFS='|' read -r repo_path commit_sha <<< "$data"
-            active_checks=$(gh api "repos/$repo_path/commits/$commit_sha/check-runs" -q '[.check_runs[] | select(.status == "queued" or .status == "in_progress")] | length' 2>/dev/null || echo "0")
+            active_checks=$(gh api "repos/$repo_path/commits/$commit_sha/check-runs" -q \
+              '[.check_runs[]
+                | select((.name | test("push")) or (.app.slug == "github-actions"))
+                | select(.status == "queued" or .status == "in_progress")]
+                | length' 2>/dev/null || echo "0")
             active_statuses=$(gh api "repos/$repo_path/commits/$commit_sha/status" -q '[.statuses[] | select(.state == "pending")] | length' 2>/dev/null || echo "0")
             total_active=$((active_checks + active_statuses))
 

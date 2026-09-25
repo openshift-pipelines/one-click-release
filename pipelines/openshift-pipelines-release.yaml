@@ -9,11 +9,14 @@ spec:
   workspaces:
     - name: source
   params:
+    - name: GITHUB_TOKEN_SECRET
+      default: "github-release"
+    - name: GITHUB_TOKEN_KEY
+      default: "github-token"
     - name: VERSION
     - name: NEW_PATCH
       default: "false"
     - name: ENVIRONMENT
-      type: string
       default: "devel"
     - name: OCP_VERSIONS
       default:
@@ -29,10 +32,14 @@ spec:
   tasks:
     - name: configure-release
       when:
-        - input: $(params.NEW_PATCH)
-          operator: in
-          values:
-            - "true"
+#        - input: $(params.NEW_PATCH)
+#          operator: in
+#          values:
+#            - "true"
+      - input: $(params.VERSION)
+        operator: notin
+        values:
+          - "main"
       workspaces:
         - workspace: source
           name: source
@@ -43,6 +50,10 @@ spec:
           value: $(params.VERSION)
         - name: NEW_PATCH
           value: $(params.NEW_PATCH)
+        - name: github-token-secret
+          value: $(params.GITHUB_TOKEN_SECRET)
+        - name: github-token-key
+          value: $(params.GITHUB_TOKEN_KEY)
     - name: process-pull-requests
       runAfter:
         - configure-release
@@ -54,9 +65,9 @@ spec:
         - name: VERSION
           value: $(params.VERSION)
         - name: github-token-secret
-          value: my-github-secret
+          value: $(params.GITHUB_TOKEN_SECRET)
         - name: github-token-key
-          value: token
+          value: $(params.GITHUB_TOKEN_KEY)
     - name: wait-for-core-snapshot
       runAfter:
         - process-pull-requests
@@ -68,9 +79,9 @@ spec:
         - name: APP
           value: core
         - name: github-token-secret
-          value: my-github-secret
+          value: $(params.GITHUB_TOKEN_SECRET)
         - name: github-token-key
-          value: token
+          value: $(params.GITHUB_TOKEN_KEY)
     - name: release-core
       when:
         - input: $(params.ENVIRONMENT)
@@ -100,9 +111,9 @@ spec:
         - name: VERSION
           value: $(params.VERSION)
         - name: github-token-secret
-          value: my-github-secret
+          value: $(params.GITHUB_TOKEN_SECRET)
         - name: github-token-key
-          value: token
+          value: $(params.GITHUB_TOKEN_KEY)
     - name: release-bundle
       when:
         - input: $(params.ENVIRONMENT)
@@ -133,9 +144,9 @@ spec:
         - name: APP
           value: index
         - name: github-token-secret
-          value: my-github-secret
+          value: $(params.GITHUB_TOKEN_SECRET)
         - name: github-token-key
-          value: token
+          value: $(params.GITHUB_TOKEN_KEY)
     - name: release-fbc
       when:
         - input: $(params.ENVIRONMENT)

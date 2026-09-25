@@ -102,7 +102,7 @@ spec:
         
         function list_prs(){
           ORG="openshift-pipelines"
-          SEARCH_LABEL="hack,upstream,konflux-nudge,approved,mintmaker,automated,one-click-release"
+          SEARCH_LABEL="hack,upstream,konflux-nudge,mintmaker,one-click-release,automated"
           BASE_BRANCH=$1
         
           # Search for PRs and save to JSON
@@ -148,7 +148,7 @@ spec:
                 gh label create "$LABEL" --repo "$REPO_NAME" --color "0E8A16" --description "Auto-created by pipeline"
               fi
             done
-            gh pr edit "$URL" --add-label "$LABELS_TO_ADD"
+            gh pr edit "$URL" --add-label "$LABELS_TO_ADD"  2>/dev/null ||  true
         
             # --- SCENARIO 4: WORKFLOWS FAILING/PENDING ---
             echo "⏳ Checking workflows..."
@@ -157,7 +157,7 @@ spec:
               FAILING_COUNT=$(echo "$CHECKS_JSON" | jq '[.[] | select(.bucket == "fail")] | length')
               if [[ "$FAILING_COUNT" -gt 0 ]]; then
                 echo "❌ SKIP: PR already has $FAILING_COUNT failing workflow(s)."
-                #gh pr comment $URL --body "/retest"
+                gh pr comment $URL --body "/retest"
                 return $STATUS_CODE_FAILED
               fi
             fi
@@ -180,7 +180,7 @@ spec:
           LABELS_TO_ADD="lgtm,approved,one-click-release"
           
           # Determine the BASE_BRANCH based on the VERSION parameter
-          if [[ "$VERSION" == "next" || "$VERSION" == "nightly" ]]; then
+          if [[ "$VERSION" == "next" || "$VERSION" == "nightly" || "$VERSION" == "main" ]]; then
             BASE_BRANCH="$VERSION"
           else
             BASE_BRANCH="release-v$VERSION.x"
@@ -264,8 +264,7 @@ spec:
           echo "❌ Failed PRs:     ${FAILING_PRS[*]}"
           if [[ ${#PENDING_PRS[@]} -gt 0 ]]; then
             echo "⏳ Pending PRs:    ${PENDING_PRS[*]}"
-          fi
-        
+          fi        
         }
         
         main

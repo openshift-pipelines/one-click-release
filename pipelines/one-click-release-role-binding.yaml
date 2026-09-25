@@ -1,0 +1,24 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: one-click-release-role-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gh-action-runner
+subjects:
+  - kind: ServiceAccount
+    name: konflux-bot-1
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: one-click-release-snapshots
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: konflux-releaser-bot-actions
+subjects:
+  - kind: ServiceAccount
+    name: konflux-bot-1

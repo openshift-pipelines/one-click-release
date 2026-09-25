@@ -6,7 +6,6 @@ spec:
   params:
     - name: VERSION
       type: string
-      default: ""
     - name: NEW_PATCH
       default: "false"
     - name: DRY_RUN
@@ -17,11 +16,8 @@ spec:
       default: main
     - name: github-token-secret
       type: string
-      default: "my-github-secret"
-      description: "Name of the secret containing the GitHub token"
     - name: github-token-key
       type: string
-      default: "token"
   volumes:
     - name: github-secret-volume
       secret:
@@ -29,7 +25,7 @@ spec:
     - name: shared-bin-dir
       emptyDir: { }
   results:
-    - name: VERSION-plan
+    - name: release-plan
       description: The VERSION plan name
     - name: snapshot
       description: The snapshot name
@@ -100,7 +96,7 @@ spec:
       script: |
         set -x
         cd repo
-        ./hack/VERSION-manager.sh \
+        ./hack/release-manager.sh \
         --action "new-patch" \
         --version "$VERSION" 
 
@@ -130,7 +126,7 @@ spec:
         git config user.email "pipeline-bot@redhat.com"
         git config user.name "Tekton Pipeline Bot"
         BASE_BRANCH=$(git branch --show-current)
-        SOURCE_BRANCH=relase/$VERSION/hack-update-konflux-config
+        SOURCE_BRANCH=one-click-release/$VERSION/update-konflux-config
         git checkout -b ${SOURCE_BRANCH}
         git add -f .konflux config
 
@@ -153,10 +149,13 @@ spec:
         fi
     - name: apply-konflux-configuration
       script: |
-        kubectl apply -Rf  ./repo/.konflux/openshift-pipelines/${VERSION/./-}
+        kubectl apply -Rf  ./repo/.konflux/openshift-pipelines/${VERSION/./-} || true
     - name: generate-tekton-config
-      description: |
-        Generate Konflux Config from Hack Repo
+      when:
+        - input: $(params.NEW_PATCH)
+          operator: in
+          values:
+            - "true"
       env:
         - name: GOCACHE
           value: $(workspaces.source.path)/.cache

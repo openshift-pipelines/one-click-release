@@ -34,6 +34,8 @@ spec:
         value: $(params.VERSION)
       - name: APP
         value: $(params.APP)
+      - name: HOME
+        value: /shared-bin
       - name: BIN_DIR
         value: /shared-bin
       - name: PATH
@@ -112,6 +114,7 @@ spec:
           mkdir -p .konflux/patches/
           echo "Forced multi-component rebuild at $(date)" > .konflux/patches/.placeholder
           
+          gh auth setup-git
           git config user.name "One Click Release Bot"
           git config user.email "one-click-release-bot@redhat.com"
           git submodule update --remote --merge --recursive
@@ -159,8 +162,8 @@ spec:
             continue
           fi
           if [ "$json_revision" != "$latest_sha" ]; then
-            if [[ "$repo_name" == "operator" && $APP=="core" ]]; then
-              echo "Skipping $repo_name"
+            if [[ "$repo_name" == "operator" && $APP == "core" ]]; then
+              echo "Skipping $repo_name for $APP"
               continue
             fi
             mismatched_repos+=("❌ $component (JSON: $json_revision -> Remote: $latest_sha)")
@@ -205,15 +208,19 @@ spec:
           IFS='|' read -r repo_path commit_sha <<< "$data"
           repo_name=$(basename "$repo_path")
           
-          active_checks=$(gh api "repos/$repo_path/commits/$commit_sha/check-runs" -q '[.check_runs[] | select(.status == "queued" or .status == "in_progress")] | length' 2>/dev/null || echo "0")
+          active_checks=$(gh api "repos/$repo_path/commits/$commit_sha/check-runs" -q \
+          '[.check_runs[]
+          | select((.name | test("push")) or (.app.slug == "github-actions"))
+          | select(.status == "queued" or .status == "in_progress")] | length' 2>/dev/null || echo "0")
+        
           active_statuses=$(gh api "repos/$repo_path/commits/$commit_sha/status" -q '[.statuses[] | select(.state == "pending")] | length' 2>/dev/null || echo "0")
           total_active=$((active_checks + active_statuses))
           
-          if [ "$total_active" -eq 0 ]; then
+          if [[ "$total_active" -eq 0 && $APP == "core" ]]; then
             commit_sha=$(rebuild_repo $repo_path $APP)
             mismatched_data+=("$repo_path|$commit_sha")
           else
-            echo "   🔄 $repo_name: Pipelines already running. (Rebuild Skipped)"
+            echo "   🔄 $repo_name: $total_active checks are already running. (Rebuild Skipped)"
           fi
           done
           
@@ -229,7 +236,11 @@ spec:
           pending_checks=0
           for data in "${mismatched_data[@]}"; do
           IFS='|' read -r repo_path commit_sha <<< "$data"
-          active_checks=$(gh api "repos/$repo_path/commits/$commit_sha/check-runs" -q '[.check_runs[] | select(.status == "queued" or .status == "in_progress")] | length' 2>/dev/null || echo "0")
+          active_checks=$(gh api "repos/$repo_path/commits/$commit_sha/check-runs" -q \
+          '[.check_runs[]
+          | select((.name | test("push")) or (.app.slug == "github-actions"))
+          | select(.status == "queued" or .status == "in_progress")] | length' 2>/dev/null || echo "0")
+        
           active_statuses=$(gh api "repos/$repo_path/commits/$commit_sha/status" -q '[.statuses[] | select(.state == "pending")] | length' 2>/dev/null || echo "0")
           total_active=$((active_checks + active_statuses))
           
