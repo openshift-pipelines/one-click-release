@@ -24,8 +24,9 @@ spec:
     - name: shared-bin-dir
       emptyDir: { }
   results:
-    - name: pr-list
-      value: $(steps.search-prs.results.pr-list)
+    - name: snapshot
+      description: The latest snapshot of the application once everything is in sync
+      value: $(steps.wait-for-snapshot.results.snapshot)
   stepTemplate:
     image: quay.io/openshift-pipeline/ci
     workingDir: /workspace
@@ -79,6 +80,8 @@ spec:
         rm -rf $GH_TAR_BALL*
 
     - name: wait-for-snapshot
+      results:
+        - name: snapshot
       script: |
         #!/usr/bin/env bash
   
@@ -319,13 +322,37 @@ spec:
           echo "=================================================="
           echo "🚀 STARTING VERIFICATION LOOP (Attempt $ATTEMPT of $MAX_ATTEMPTS)"
           echo "=================================================="
-          verify_application $APPLICATION
-          
+          # 'read' blanks APPLICATION on the EOF iteration, keep the name for the result below
+          VERIFIED_APPLICATION="$APPLICATION"
+          verify_application "$APPLICATION"
+
           #    ATTEMPT=$((ATTEMPT + 1))
           #done
-          done <<< $APPS
-          
-          
+          # "$APPS" stays quoted, the applications are one per line
+          done <<< "$APPS"
+
+          # Publish the snapshot everything is in sync with, it is the one the
+          # release and the project.yaml update are based on.
+          if [ -z "$VERIFIED_APPLICATION" ]; then
+          echo "❌ No application matching '$APP' and '${VERSION//./-}' was verified, cannot resolve a snapshot."
+          exit 1
+          fi
+
+          FINAL_SNAPSHOT=$(
+          oc get snapshots \
+          -l "pac.test.appstudio.openshift.io/event-type=push,appstudio.openshift.io/application=${VERIFIED_APPLICATION}" \
+          --sort-by=.metadata.creationTimestamp \
+          -o jsonpath='{.items[*].metadata.name}' | awk '{print $NF}'
+          )
+          echo "📦 Latest snapshot of $VERIFIED_APPLICATION: $FINAL_SNAPSHOT"
+          echo -n "$FINAL_SNAPSHOT" > $(step.results.snapshot.path)
+
+          if [ -z "$FINAL_SNAPSHOT" ]; then
+          echo "❌ No push snapshot found for $VERIFIED_APPLICATION."
+          exit 1
+          fi
+
+
           if [ $ATTEMPT -gt $MAX_ATTEMPTS ]; then
           echo "❌ Reached maximum attempts ($MAX_ATTEMPTS). The snapshot is still not syncing."
           exit 1
