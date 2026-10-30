@@ -32,10 +32,10 @@ spec:
   tasks:
     - name: configure-release
       when:
-#        - input: $(params.NEW_PATCH)
-#          operator: in
-#          values:
-#            - "true"
+      - input: $(params.NEW_PATCH)
+        operator: in
+        values:
+          - "true"
       - input: $(params.VERSION)
         operator: notin
         values:
@@ -54,7 +54,9 @@ spec:
           value: $(params.GITHUB_TOKEN_SECRET)
         - name: github-token-key
           value: $(params.GITHUB_TOKEN_KEY)
-    - name: process-pull-requests
+    # The generated Konflux configuration has to land first, the builds of
+    # every other PR depend on it.
+    - name: process-hack-prs
       runAfter:
         - configure-release
       taskRef:
@@ -62,6 +64,23 @@ spec:
       params:
         - name: SEARCH_LABEL
           value: "hack"
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: github-token-secret
+          value: $(params.GITHUB_TOKEN_SECRET)
+        - name: github-token-key
+          value: $(params.GITHUB_TOKEN_KEY)
+    - name: process-pull-requests
+      runAfter:
+        - process-hack-prs
+      taskRef:
+        name: osp-github-pr-processor
+      params:
+        - name: SEARCH_LABEL
+          value: "hack,upstream,mintmaker,one-click-release,automated"
+        # Nudge PRs are processed later, once the core snapshot is ready
+        - name: EXCLUDE_LABEL
+          value: "konflux-nudge"
         - name: VERSION
           value: $(params.VERSION)
         - name: github-token-secret
@@ -100,16 +119,66 @@ spec:
           value: $(params.ENVIRONMENT)
         - name: VERSION
           value: $(params.VERSION)
-    - name: process-nudge-prs
+    - name: update-project-yaml
       runAfter:
         - wait-for-core-snapshot
       taskRef:
-        name: osp-github-pr-processor
+        name: update-project-yaml-task
       params:
-        - name: SEARCH_LABEL
-          value: "konflux-nudge"
         - name: VERSION
           value: $(params.VERSION)
+        - name: SNAPSHOT
+          value: $(tasks.wait-for-core-snapshot.results.snapshot)
+        - name: github-token-secret
+          value: $(params.GITHUB_TOKEN_SECRET)
+        - name: github-token-key
+          value: $(params.GITHUB_TOKEN_KEY)
+    # Merge the project.yaml update, the bundle is built from it
+    - name: process-project-yaml-pr
+      runAfter:
+        - update-project-yaml
+      taskRef:
+        name: osp-github-pr-processor
+      params:
+        # Target the generated PR only, by the branch it was opened from
+        - name: HEAD_BRANCH
+          value: $(tasks.update-project-yaml.results.pr-branch)
+        - name: SEARCH_LABEL
+          value: ""
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: github-token-secret
+          value: $(params.GITHUB_TOKEN_SECRET)
+        - name: github-token-key
+          value: $(params.GITHUB_TOKEN_KEY)
+    - name: wait-for-bundle-snapshot
+      runAfter:
+        - process-project-yaml-pr
+      taskRef:
+        name: wait-for-snapshot
+      params:
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: APP
+          value: bundle
+        - name: github-token-secret
+          value: $(params.GITHUB_TOKEN_SECRET)
+        - name: github-token-key
+          value: $(params.GITHUB_TOKEN_KEY)
+    # Same as project.yaml, but the bundle image reference of bundle.yaml,
+    # taken from the bundle snapshot. The index images are built from it.
+    - name: update-bundle-yaml
+      runAfter:
+        - wait-for-bundle-snapshot
+      taskRef:
+        name: update-project-yaml-task
+      params:
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: SNAPSHOT
+          value: $(tasks.wait-for-bundle-snapshot.results.snapshot)
+        - name: PROJECT_FILE
+          value: "bundle.yaml"
         - name: github-token-secret
           value: $(params.GITHUB_TOKEN_SECRET)
         - name: github-token-key
@@ -122,7 +191,7 @@ spec:
             - "stage"
             - "prod"
       runAfter:
-        - process-nudge-prs
+        - wait-for-bundle-snapshot
         - release-core
       taskRef:
         name: konflux-release-task
@@ -133,9 +202,28 @@ spec:
           value: $(params.ENVIRONMENT)
         - name: VERSION
           value: $(params.VERSION)
+    # Merged only once the bundle is released, it is what nudges the index builds
+    - name: process-bundle-yaml-pr
+      runAfter:
+        - update-bundle-yaml
+        - release-bundle
+      taskRef:
+        name: osp-github-pr-processor
+      params:
+        - name: HEAD_BRANCH
+          value: $(tasks.update-bundle-yaml.results.pr-branch)
+        - name: SEARCH_LABEL
+          value: ""
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: github-token-secret
+          value: $(params.GITHUB_TOKEN_SECRET)
+        - name: github-token-key
+          value: $(params.GITHUB_TOKEN_KEY)
     - name: wait-for-fbc-snapshot
       runAfter:
         - release-bundle
+        - process-bundle-yaml-pr
       taskRef:
         name: wait-for-snapshot
       params:
@@ -168,4 +256,29 @@ spec:
           value: $(params.VERSION)
       taskRef:
         name: konflux-release-task
+#    - name: copy-fbc-index-images
+#      when:
+#        - input: $(params.ENVIRONMENT)
+#          operator: in
+#          values:
+#            - "stage"
+#            - "prod"
+#      runAfter:
+#        - release-fbc
+#      matrix:
+#        params:
+#          - name: RELEASE
+#            value:
+#              - $(tasks.release-fbc.results.release[*])
+#      params:
+#        - name: VERSION
+#          value: $(params.VERSION)
+#        - name: ENVIRONMENT
+#          value: $(params.ENVIRONMENT)
+#        - name: source-auth-secret
+#          value: $(params.SOURCE_REGISTRY_AUTH_SECRET)
+#        - name: target-auth-secret
+#          value: $(params.TARGET_REGISTRY_AUTH_SECRET)
+#      taskRef:
+#        name: copy-fbc-index-task
 
