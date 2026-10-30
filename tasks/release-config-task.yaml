@@ -113,40 +113,40 @@ spec:
         rm -rf .konflux/openshift-pipelines/${VERSION//./-} 
         go run ./cmd/konflux --version=$VERSION --dry-run=$(params.DRY_RUN) --generate-tekton=false
 
-    - name: commit-new-changes
-      when:
-        - input: $(params.DRY_RUN)
-          operator: in
-          values:
-            - "false"
-      script: |
-        # 1. Set the Git identity for this workspace
-        cd repo
-        gh auth setup-git
-        git config user.email "pipeline-bot@redhat.com"
-        git config user.name "Tekton Pipeline Bot"
-        BASE_BRANCH=$(git branch --show-current)
-        SOURCE_BRANCH=one-click-release/$VERSION/update-konflux-config
-        git checkout -b ${SOURCE_BRANCH}
-        git add -f .konflux config
-
-        if [[ -z $(git status --porcelain --untracked-files=no) ]]; then
-          echo "No change, exiting"
-          exit 0
-        fi
-
-        git commit -F- <<EOF
-          [bot:$VERSION] Update Generated Konflux Config
-        EOF
-
-        git push -f origin ${SOURCE_BRANCH}
-        set -x
-        if [ "$(gh pr list --base ${BASE_BRANCH} --head ${SOURCE_BRANCH} --json url --jq 'length')" = "0" ]; then
-          echo "creating PR..."
-          gh pr create -B ${BASE_BRANCH} -H ${SOURCE_BRANCH} --label=automated --label=hack   --fill
-        else 
-          echo "PR already exists: $(gh pr list --base ${BASE_BRANCH} --head ${SOURCE_BRANCH} --json url --jq .[].url)"
-        fi
+#    - name: commit-new-changes
+#      when:
+#        - input: $(params.DRY_RUN)
+#          operator: in
+#          values:
+#            - "false"
+#      script: |
+#        # 1. Set the Git identity for this workspace
+#        cd repo
+#        gh auth setup-git
+#        git config user.email "pipeline-bot@redhat.com"
+#        git config user.name "Tekton Pipeline Bot"
+#        BASE_BRANCH=$(git branch --show-current)
+#        SOURCE_BRANCH=one-click-release/$VERSION/update-konflux-config
+#        git checkout -b ${SOURCE_BRANCH}
+#        git add -f .konflux config
+#
+#        if [[ -z $(git status --porcelain --untracked-files=no) ]]; then
+#          echo "No change, exiting"
+#          exit 0
+#        fi
+#
+#        git commit -F- <<EOF
+#          [bot:$VERSION] Update Generated Konflux Config
+#        EOF
+#
+#        git push -f origin ${SOURCE_BRANCH}
+#        set -x
+#        if [ "$(gh pr list --base ${BASE_BRANCH} --head ${SOURCE_BRANCH} --json url --jq 'length')" = "0" ]; then
+#          echo "creating PR..."
+#          gh pr create -B ${BASE_BRANCH} -H ${SOURCE_BRANCH} --label=automated --label=hack   --fill
+#        else
+#          echo "PR already exists: $(gh pr list --base ${BASE_BRANCH} --head ${SOURCE_BRANCH} --json url --jq .[].url)"
+#        fi
     - name: apply-konflux-configuration
       script: |
         kubectl apply -Rf  ./repo/.konflux/openshift-pipelines/${VERSION/./-} || true

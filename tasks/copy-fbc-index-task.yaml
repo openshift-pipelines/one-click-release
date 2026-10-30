@@ -1,0 +1,219 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: copy-fbc-index-task
+spec:
+  description: >-
+    Copies the FBC index image produced by a Konflux FBC Release to a publicly
+    readable Quay repository. The released index images live on the internal
+    OSBS/IIB registry (registry-proxy.engineering.redhat.com/rh-osbs/...) which
+    needs authentication, so they are mirrored to
+    <TARGET_REGISTRY>/<component-image-name>:<VERSION>-<ENVIRONMENT>
+    e.g. quay.io/openshift-pipeline/pipelines-index-4.14:1.22-stage
+  params:
+    - name: RELEASE
+      type: string
+      description: "Name of the Release CR created for the FBC application"
+    - name: VERSION
+      type: string
+      description: "Minor version being released, e.g. 1.22"
+    - name: ENVIRONMENT
+      type: string
+      default: "stage"
+      description: "Target environment, used as the tag suffix (stage/prod)"
+    - name: TARGET_REGISTRY
+      type: string
+      default: "quay.io/openshift-pipeline"
+      description: "Registry/organization the index images are copied to"
+    - name: TARGET_TAG
+      type: string
+      default: ""
+      description: "Overrides the computed <VERSION>-<ENVIRONMENT> tag"
+    - name: source-auth-secret
+      type: string
+      default: "rh-osbs-pull-secret"
+      description: "dockerconfigjson secret with pull access to the OSBS/IIB registry"
+    - name: source-auth-key
+      type: string
+      default: ""
+      description: "Key holding the docker config, auto-detected when empty"
+    - name: target-auth-secret
+      type: string
+      default: "release-registry-openshift-pipelines-quay"
+      description: "dockerconfigjson secret with push access to TARGET_REGISTRY"
+    - name: target-auth-key
+      type: string
+      default: ""
+      description: "Key holding the docker config, auto-detected when empty"
+  volumes:
+    - name: source-auth
+      secret:
+        secretName: $(params.source-auth-secret)
+        optional: true
+    - name: target-auth
+      secret:
+        secretName: $(params.target-auth-secret)
+        optional: true
+  results:
+    - name: source-image
+      description: The released index image on the internal registry
+      value: $(steps.copy-index-image.results.source-image)
+    - name: target-image
+      description: The publicly readable copy of the index image
+      value: $(steps.copy-index-image.results.target-image)
+  stepTemplate:
+    image: quay.io/openshift-pipeline/ci
+    env:
+      - name: RELEASE
+        value: $(params.RELEASE)
+      - name: VERSION
+        value: $(params.VERSION)
+      - name: ENVIRONMENT
+        value: $(params.ENVIRONMENT)
+      - name: TARGET_REGISTRY
+        value: $(params.TARGET_REGISTRY)
+      - name: TARGET_TAG
+        value: $(params.TARGET_TAG)
+      - name: SOURCE_AUTH_DIR
+        value: /etc/source-auth
+      - name: SOURCE_AUTH_KEY
+        value: $(params.source-auth-key)
+      - name: TARGET_AUTH_DIR
+        value: /etc/target-auth
+      - name: TARGET_AUTH_KEY
+        value: $(params.target-auth-key)
+    volumeMounts:
+      - name: source-auth
+        mountPath: /etc/source-auth
+        readOnly: true
+      - name: target-auth
+        mountPath: /etc/target-auth
+        readOnly: true
+  steps:
+    - name: copy-index-image
+      results:
+        - name: source-image
+        - name: target-image
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        TAG="$TARGET_TAG"
+        if [[ -z "$TAG" ]]; then
+          TAG="${VERSION}-${ENVIRONMENT}"
+        fi
+
+        echo "Reading released index image from Release: $RELEASE"
+        RELEASE_JSON=$(oc get release "$RELEASE" -o json)
+        ARTIFACTS=$(jq -c '.status.artifacts // {}' <<< "$RELEASE_JSON")
+
+        echo "Release artifacts:"
+        jq . <<< "$ARTIFACTS"
+
+        # The FBC release pipeline reports the index image either as an object
+        # ({index_image, index_image_resolved}) or as a plain string, depending
+        # on the catalog version. Prefer the digest pinned reference.
+        SOURCE_IMAGE=$(jq -r '
+          if (.index_image | type) == "object" then
+            (.index_image.index_image_resolved // .index_image.index_image // empty)
+          elif (.index_image | type) == "string" then
+            (.index_image_resolved // .index_image)
+          else
+            empty
+          end' <<< "$ARTIFACTS")
+
+        if [[ -z "$SOURCE_IMAGE" ]]; then
+          # Fall back to any image reference pointing at the OSBS/IIB registry.
+          SOURCE_IMAGE=$(jq -r '[.. | strings | select(test("rh-osbs|/iib"))] | .[0] // empty' <<< "$ARTIFACTS")
+        fi
+
+        if [[ -z "$SOURCE_IMAGE" ]]; then
+          echo "ERROR: could not find an index image in the artifacts of release $RELEASE" >&2
+          exit 1
+        fi
+
+        SNAPSHOT=$(jq -r '.spec.snapshot' <<< "$RELEASE_JSON")
+        echo "Reading components from snapshot: $SNAPSHOT"
+        COMPONENT_IMAGE=$(oc get snapshot "$SNAPSHOT" -o json | jq -r '.spec.components[0].containerImage')
+        COMPONENT_COUNT=$(oc get snapshot "$SNAPSHOT" -o json | jq -r '.spec.components | length')
+        if [[ "$COMPONENT_COUNT" != "1" ]]; then
+          echo "WARNING: snapshot $SNAPSHOT has $COMPONENT_COUNT components, using the first one for the image name"
+        fi
+
+        # quay.io/redhat-user-workloads/<tenant>/pipelines-index-4.14@sha256:... -> pipelines-index-4.14
+        IMAGE_NAME=${COMPONENT_IMAGE%%@*}
+        IMAGE_NAME=${IMAGE_NAME##*/}
+        IMAGE_NAME=${IMAGE_NAME%%:*}
+
+        TARGET_IMAGE="${TARGET_REGISTRY}/${IMAGE_NAME}:${TAG}"
+
+        echo "Source: $SOURCE_IMAGE"
+        echo "Target: $TARGET_IMAGE"
+
+        # Secrets hold the docker config under different keys
+        # (.dockerconfigjson, config.json, .dockercfg), so locate it instead of
+        # assuming one. Prints nothing when no credentials are mounted.
+        find_auth() {
+          local dir=$1 key=$2 candidate
+          if [[ -n "$key" && -s "$dir/$key" ]]; then
+            echo "$dir/$key"
+            return
+          fi
+          for candidate in .dockerconfigjson config.json .dockercfg; do
+            if [[ -s "$dir/$candidate" ]]; then
+              echo "$dir/$candidate"
+              return
+            fi
+          done
+          find "$dir" -maxdepth 1 -type f -size +0 2>/dev/null | head -n1
+        }
+
+        # Merge the pull and push credentials into a single auth file. A
+        # .dockercfg secret has no "auths" wrapper, so add one when missing.
+        read_auth() {
+          local file=$1
+          if [[ -z "$file" ]]; then
+            echo '{}'
+            return
+          fi
+          jq -c 'if has("auths") then . else {auths: .} end' "$file"
+        }
+
+        SOURCE_AUTH_FILE=$(find_auth "$SOURCE_AUTH_DIR" "$SOURCE_AUTH_KEY")
+        TARGET_AUTH_FILE=$(find_auth "$TARGET_AUTH_DIR" "$TARGET_AUTH_KEY")
+        [[ -n "$SOURCE_AUTH_FILE" ]] || echo "WARNING: no credentials mounted for the source registry"
+        [[ -n "$TARGET_AUTH_FILE" ]] || echo "WARNING: no credentials mounted for the target registry"
+
+        AUTH_FILE=/tmp/auth.json
+        jq -n \
+          --argjson src "$(read_auth "$SOURCE_AUTH_FILE")" \
+          --argjson dest "$(read_auth "$TARGET_AUTH_FILE")" \
+          '{auths: (($src.auths // {}) + ($dest.auths // {}))}' > "$AUTH_FILE"
+        echo "Registries in the merged auth file: $(jq -r '.auths | keys | join(", ")' "$AUTH_FILE")"
+
+        copy_image() {
+          if command -v skopeo > /dev/null; then
+            skopeo copy --all --authfile "$AUTH_FILE" \
+              "docker://${SOURCE_IMAGE}" "docker://${TARGET_IMAGE}"
+          else
+            oc image mirror -a "$AUTH_FILE" --keep-manifest-list \
+              "${SOURCE_IMAGE}=${TARGET_IMAGE}"
+          fi
+        }
+
+        for attempt in 1 2 3; do
+          if copy_image; then
+            echo "Copied $SOURCE_IMAGE to $TARGET_IMAGE"
+            break
+          fi
+          if [[ "$attempt" == "3" ]]; then
+            echo "ERROR: failed to copy $SOURCE_IMAGE to $TARGET_IMAGE after $attempt attempts" >&2
+            exit 1
+          fi
+          echo "Copy failed, retrying in 30s (attempt $attempt)..."
+          sleep 30
+        done
+
+        echo -n "$SOURCE_IMAGE" | tee $(step.results.source-image.path)
+        echo
+        echo -n "$TARGET_IMAGE" | tee $(step.results.target-image.path)
