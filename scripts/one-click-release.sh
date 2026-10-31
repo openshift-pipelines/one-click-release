@@ -2,7 +2,10 @@
 
 VERSION=${1:-nightly}
 ENVIRONMENT=${2:-devel}
-NEW_PATCH=${3:-false}
+START_FROM=${3:-BUILD}
+NEW_PATCH=${4:-false}
+SNAPSHOTS=${5:-}
+
 
 #Create Task and Pipeline
 oc apply -f tasks -f pipelines
@@ -14,18 +17,8 @@ tkn pipeline start one-click-release \
   --param VERSION=$VERSION \
   --param NEW_PATCH=$NEW_PATCH \
   --param ENVIRONMENT=$ENVIRONMENT \
+  --param START_FROM=$START_FROM \
+  --param SNAPSHOTS=$SNAPSHOTS \
   --use-param-defaults \
   -w name=source,emptyDir="" \
   --showlog
-
-#tkn task start konflux-release-task \
-#  --serviceaccount=gh-action \
-#  --param APPLICATION=openshift-pipelines-core-1-22 \
-#  --param ENVIRONMENT=stage \
-#  --showlog
-#
-#tkn task start konflux-release-task \
-#  --serviceaccount=gh-action \
-#  --param APPLICATION=openshift-pipelines-bundle-1-22 \
-#  --param ENVIRONMENT=stage \
-#  --showlog
