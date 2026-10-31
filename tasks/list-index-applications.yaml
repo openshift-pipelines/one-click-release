@@ -1,0 +1,59 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: list-index-applications
+spec:
+  description: >-
+    Lists the OCP versions a release has an index application for, so that the
+    index releases fan out over what Konflux actually holds. The supported set
+    moves between releases, 5-0 only exists from 1.24 on and 4-23 is not
+    released at all for now, so a static list goes stale and the release task
+    then fails on an application that cannot be resolved.
+  params:
+    - name: VERSION
+      type: string
+      description: "Minor version being released, e.g. 1.23"
+    - name: OCP_VERSIONS
+      type: array
+      default: []
+      description: >-
+        Pins the OCP versions instead of looking them up, e.g. to release a
+        single index. The applications are listed when it is empty.
+  results:
+    - name: ocp-versions
+      type: array
+      description: 'OCP versions of the index applications, e.g. ["4-14", "5-0"]'
+  steps:
+    - name: list-applications
+      image: quay.io/openshift-pipeline/ci
+      env:
+        - name: VERSION
+          value: $(params.VERSION)
+      # An array param can only be expanded into args, "$@" below is the list
+      args:
+        - $(params.OCP_VERSIONS[*])
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        if [[ $# -gt 0 ]]; then
+          echo "Using the $# OCP version(s) passed in: $*"
+          printf '%s\n' "$@" | jq -R . | jq -sc . | tee $(results.ocp-versions.path)
+          exit 0
+        fi
+
+        # openshift-pipelines-index-4-14-1-23 -> 4-14
+        echo "Looking up the index applications of $VERSION"
+        OCP_VERSIONS=$(oc get application -o json | jq -c --arg V "${VERSION//./-}" '
+          [ .items[].metadata.name
+            | select(contains("index") and contains("-" + $V))
+            | capture("index-(?<ocp>[0-9]+-[0-9]+)-").ocp ]
+          | unique')
+
+        if [[ "$OCP_VERSIONS" == "[]" ]]; then
+          echo "ERROR: no index application found for $VERSION" >&2
+          exit 1
+        fi
+
+        echo "Index applications cover: $(jq -r 'join(", ")' <<< "$OCP_VERSIONS")"
+        echo -n "$OCP_VERSIONS" > $(results.ocp-versions.path)

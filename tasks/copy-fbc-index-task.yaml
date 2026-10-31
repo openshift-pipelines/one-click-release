@@ -11,9 +11,20 @@ spec:
     <TARGET_REGISTRY>/<component-image-name>:<VERSION>-<ENVIRONMENT>
     e.g. quay.io/openshift-pipeline/pipelines-index-4.14:1.22-stage
   params:
-    - name: RELEASE
+    - name: RELEASES
+      type: array
+      description: >-
+        Names of the Release CRs created for the FBC applications, typically the
+        fanned out results of the matrixed release task. When empty the latest
+        successful Release of every index application matching APPLICATION,
+        VERSION and ENVIRONMENT is used instead.
+      default: []
+    - name: APPLICATION
       type: string
-      description: "Name of the Release CR created for the FBC application"
+      default: "index"
+      description: >-
+        Substring of the Konflux application name, combined with VERSION to find
+        the index application when RELEASE is empty, e.g. "index" or "4-14"
     - name: VERSION
       type: string
       description: "Minor version being released, e.g. 1.22"
@@ -29,9 +40,18 @@ spec:
       type: string
       default: ""
       description: "Overrides the computed <VERSION>-<ENVIRONMENT> tag"
+    - name: SOURCE_REGISTRY
+      type: string
+      default: "brew.registry.redhat.io"
+      description: >-
+        Host the index image is pulled from, it replaces the host of the
+        reference found in the Release. The releases point at
+        registry-proxy.engineering.redhat.com, which does not resolve from
+        Konflux, brew.registry.redhat.io serves the same rh-osbs images.
+        Leave empty to pull from the host the Release names.
     - name: source-auth-secret
       type: string
-      default: "rh-osbs-pull-secret"
+      default: "brew"
       description: "dockerconfigjson secret with pull access to the OSBS/IIB registry"
     - name: source-auth-key
       type: string
@@ -39,7 +59,7 @@ spec:
       description: "Key holding the docker config, auto-detected when empty"
     - name: target-auth-secret
       type: string
-      default: "release-registry-openshift-pipelines-quay"
+      default: "openshift-pipeline-konflux-secret"
       description: "dockerconfigjson secret with push access to TARGET_REGISTRY"
     - name: target-auth-key
       type: string
@@ -55,17 +75,31 @@ spec:
         secretName: $(params.target-auth-secret)
         optional: true
   results:
-    - name: source-image
-      description: The released index image on the internal registry
-      value: $(steps.copy-index-image.results.source-image)
-    - name: target-image
-      description: The publicly readable copy of the index image
-      value: $(steps.copy-index-image.results.target-image)
+    - name: releases
+      description: Space separated Releases the index images were read from
+      value: $(steps.resolve-releases.results.releases)
+    - name: source-images
+      description: Space separated released index images on the internal registry
+      value: $(steps.copy-index-images.results.source-images)
+    - name: target-images
+      description: Space separated publicly readable copies of the index images
+      value: $(steps.copy-index-images.results.target-images)
+    - name: snapshots
+      description: Space separated snapshots the index images were built from
+      value: $(steps.copy-index-images.results.snapshots)
+    - name: commits
+      description: Space separated commits the snapshots were built from
+      value: $(steps.copy-index-images.results.commits)
+    - name: summary
+      description: >-
+        Human readable report of the mirroring, in Slack mrkdwn, ready to be
+        posted in the release notification
+      value: $(steps.copy-index-images.results.summary)
   stepTemplate:
     image: quay.io/openshift-pipeline/ci
     env:
-      - name: RELEASE
-        value: $(params.RELEASE)
+      - name: APPLICATION
+        value: $(params.APPLICATION)
       - name: VERSION
         value: $(params.VERSION)
       - name: ENVIRONMENT
@@ -74,6 +108,8 @@ spec:
         value: $(params.TARGET_REGISTRY)
       - name: TARGET_TAG
         value: $(params.TARGET_TAG)
+      - name: SOURCE_REGISTRY
+        value: $(params.SOURCE_REGISTRY)
       - name: SOURCE_AUTH_DIR
         value: /etc/source-auth
       - name: SOURCE_AUTH_KEY
@@ -90,10 +126,103 @@ spec:
         mountPath: /etc/target-auth
         readOnly: true
   steps:
-    - name: copy-index-image
+    - name: resolve-releases
       results:
-        - name: source-image
-        - name: target-image
+        - name: releases
+      # An array param can only be expanded into args, "$@" below is the list
+      args:
+        - $(params.RELEASES[*])
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        if [[ $# -gt 0 ]]; then
+          echo "Using the $# Release(s) passed in: $*"
+          echo -n "$*" > $(step.results.releases.path)
+          exit 0
+        fi
+
+        # No Releases were passed in, the task is run on its own or after FBC
+        # releases that already happened. Find the index applications the same
+        # way konflux-release-task does, by name, then take the latest Release
+        # of each. APPLICATION=index covers every OCP version of a release,
+        # narrow it (index-4-14) to copy a single one.
+        echo "RELEASE is empty, looking for the latest '$APPLICATION' releases of $VERSION on $ENVIRONMENT"
+
+        APPS=$(oc get application -o json | jq -r \
+          --arg APP "$APPLICATION" --arg VERSION "${VERSION//./-}" '
+            .items[]
+            | select(.metadata.name | contains($APP) and contains($VERSION))
+            | .metadata.name' | sort)
+
+        if [[ -z "$APPS" ]]; then
+          echo "ERROR: no application matching '$APPLICATION' and '${VERSION//./-}' was found" >&2
+          exit 1
+        fi
+        echo "Applications:"
+        sed 's/^/  - /' <<< "$APPS"
+
+        # Read each collection once, the namespace holds thousands of releases.
+        PLANS_JSON=$(oc get releaseplan -o json)
+        RELEASES_JSON=$(oc get releases -o json)
+
+        RELEASES=()
+        MISSING=()
+        while read -r APP; do
+          [[ -n "$APP" ]] || continue
+
+          # The release plans are per environment, the name carries stage/prod.
+          PLANS=$(jq -c --arg APP "$APP" --arg ENVX "$ENVIRONMENT" '
+            [ .items[]
+              | select(.spec.application == $APP and (.metadata.name | contains($ENVX)))
+              | .metadata.name ]' <<< "$PLANS_JSON")
+
+          if [[ "$PLANS" == "[]" ]]; then
+            echo "  ❌ $APP: no release plan targets '$ENVIRONMENT'"
+            MISSING+=("$APP")
+            continue
+          fi
+
+          # Only a succeeded Release carries the index image in its artifacts, a
+          # running or failed one would be copied as an empty reference.
+          REL=$(jq -r --argjson PLANS "$PLANS" '
+            [ .items[]
+              | select(.spec.releasePlan | IN($PLANS[]))
+              | select(any(.status.conditions[]?; .type == "Released" and .status == "True")) ]
+            | sort_by(.status.completionTime // .metadata.creationTimestamp)
+            | last
+            | .metadata.name // empty' <<< "$RELEASES_JSON")
+
+          if [[ -z "$REL" ]]; then
+            echo "  ❌ $APP: no successful Release on '$ENVIRONMENT'"
+            MISSING+=("$APP")
+            continue
+          fi
+
+          echo "  ✅ $APP -> $REL"
+          RELEASES+=("$REL")
+        done <<< "$APPS"
+
+        # A half copied index set is worse than none, the catalogs of the
+        # missing OCP versions would keep pointing at the previous release.
+        if [[ ${#MISSING[@]} -gt 0 ]]; then
+          echo "ERROR: no release to copy for ${#MISSING[@]} application(s): ${MISSING[*]}" >&2
+          exit 1
+        fi
+
+        echo "Releases to copy: ${RELEASES[*]}"
+        echo -n "${RELEASES[*]}" > $(step.results.releases.path)
+
+    - name: copy-index-images
+      results:
+        - name: source-images
+        - name: target-images
+        - name: snapshots
+        - name: commits
+        - name: summary
+      env:
+        - name: RELEASES
+          value: $(steps.resolve-releases.results.releases)
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
@@ -103,52 +232,73 @@ spec:
           TAG="${VERSION}-${ENVIRONMENT}"
         fi
 
-        echo "Reading released index image from Release: $RELEASE"
-        RELEASE_JSON=$(oc get release "$RELEASE" -o json)
-        ARTIFACTS=$(jq -c '.status.artifacts // {}' <<< "$RELEASE_JSON")
+        # Resolve the released index image of one Release and the repository it
+        # is copied to. Prints "<source> <target>".
+        resolve_images() {
+          local RELEASE=$1
 
-        echo "Release artifacts:"
-        jq . <<< "$ARTIFACTS"
+          echo "Reading released index image from Release: $RELEASE" >&2
+          RELEASE_JSON=$(oc get release "$RELEASE" -o json)
+          ARTIFACTS=$(jq -c '.status.artifacts // {}' <<< "$RELEASE_JSON")
 
-        # The FBC release pipeline reports the index image either as an object
-        # ({index_image, index_image_resolved}) or as a plain string, depending
-        # on the catalog version. Prefer the digest pinned reference.
-        SOURCE_IMAGE=$(jq -r '
-          if (.index_image | type) == "object" then
-            (.index_image.index_image_resolved // .index_image.index_image // empty)
-          elif (.index_image | type) == "string" then
-            (.index_image_resolved // .index_image)
-          else
-            empty
-          end' <<< "$ARTIFACTS")
+          # The FBC release pipeline reports the index image in three shapes:
+          # per component, as .index_image keyed by OCP version
+          # ({"v4.14": {index_image, index_image_resolved}}), or flat as a plain
+          # string. Prefer the digest pinned reference in all of them.
+          SOURCE_IMAGE=$(jq -r '
+            [ (.components[]? | .index_image_resolved // .index_image // empty),
+              ( if (.index_image | type) == "object" then
+                  ( (.index_image.index_image_resolved // .index_image.index_image // empty),
+                    (.index_image | to_entries[]? | .value
+                       | if type == "object" then (.index_image_resolved // .index_image // empty) else empty end) )
+                elif (.index_image | type) == "string" then
+                  (.index_image_resolved // .index_image)
+                else empty end )
+            ]
+            | map(select(type == "string" and . != ""))
+            | .[0] // empty' <<< "$ARTIFACTS")
 
-        if [[ -z "$SOURCE_IMAGE" ]]; then
-          # Fall back to any image reference pointing at the OSBS/IIB registry.
-          SOURCE_IMAGE=$(jq -r '[.. | strings | select(test("rh-osbs|/iib"))] | .[0] // empty' <<< "$ARTIFACTS")
-        fi
+          if [[ -z "$SOURCE_IMAGE" ]]; then
+            # Fall back to any image reference pointing at the OSBS registry.
+            # "/iib" is deliberately not matched here, the iibLog artifact is a
+            # https://iib.engineering.redhat.com/... URL and would win.
+            SOURCE_IMAGE=$(jq -r '[.. | strings | select(test("rh-osbs"))] | .[0] // empty' <<< "$ARTIFACTS")
+          fi
 
-        if [[ -z "$SOURCE_IMAGE" ]]; then
-          echo "ERROR: could not find an index image in the artifacts of release $RELEASE" >&2
-          exit 1
-        fi
+          if [[ -z "$SOURCE_IMAGE" ]]; then
+            echo "ERROR: could not find an index image in the artifacts of release $RELEASE" >&2
+            jq . <<< "$ARTIFACTS" >&2
+            return 1
+          fi
 
-        SNAPSHOT=$(jq -r '.spec.snapshot' <<< "$RELEASE_JSON")
-        echo "Reading components from snapshot: $SNAPSHOT"
-        COMPONENT_IMAGE=$(oc get snapshot "$SNAPSHOT" -o json | jq -r '.spec.components[0].containerImage')
-        COMPONENT_COUNT=$(oc get snapshot "$SNAPSHOT" -o json | jq -r '.spec.components | length')
-        if [[ "$COMPONENT_COUNT" != "1" ]]; then
-          echo "WARNING: snapshot $SNAPSHOT has $COMPONENT_COUNT components, using the first one for the image name"
-        fi
+          # registry-proxy.engineering.redhat.com does not resolve from the
+          # Konflux cluster, pull the same rh-osbs image from the mirror the
+          # mounted pull secret covers.
+          if [[ -n "$SOURCE_REGISTRY" && "${SOURCE_IMAGE%%/*}" != "$SOURCE_REGISTRY" ]]; then
+            echo "Pulling from $SOURCE_REGISTRY instead of ${SOURCE_IMAGE%%/*}" >&2
+            SOURCE_IMAGE="${SOURCE_REGISTRY}/${SOURCE_IMAGE#*/}"
+          fi
 
-        # quay.io/redhat-user-workloads/<tenant>/pipelines-index-4.14@sha256:... -> pipelines-index-4.14
-        IMAGE_NAME=${COMPONENT_IMAGE%%@*}
-        IMAGE_NAME=${IMAGE_NAME##*/}
-        IMAGE_NAME=${IMAGE_NAME%%:*}
+          SNAPSHOT=$(jq -r '.spec.snapshot' <<< "$RELEASE_JSON")
+          SNAPSHOT_JSON=$(oc get snapshot "$SNAPSHOT" -o json)
+          COMPONENT_IMAGE=$(jq -r '.spec.components[0].containerImage' <<< "$SNAPSHOT_JSON")
+          COMPONENT_COUNT=$(jq -r '.spec.components | length' <<< "$SNAPSHOT_JSON")
+          if [[ "$COMPONENT_COUNT" != "1" ]]; then
+            echo "WARNING: snapshot $SNAPSHOT has $COMPONENT_COUNT components, using the first one for the image name" >&2
+          fi
 
-        TARGET_IMAGE="${TARGET_REGISTRY}/${IMAGE_NAME}:${TAG}"
+          # The commit the index was built from, for the release notification
+          # and to tie a published image back to the operator repository.
+          COMMIT=$(jq -r '.spec.components[0].source.git.revision // ""' <<< "$SNAPSHOT_JSON")
+          [[ -n "$COMMIT" ]] || COMMIT="unknown"
 
-        echo "Source: $SOURCE_IMAGE"
-        echo "Target: $TARGET_IMAGE"
+          # quay.io/redhat-user-workloads/<tenant>/pipelines-index-4.14@sha256:... -> pipelines-index-4.14
+          IMAGE_NAME=${COMPONENT_IMAGE%%@*}
+          IMAGE_NAME=${IMAGE_NAME##*/}
+          IMAGE_NAME=${IMAGE_NAME%%:*}
+
+          echo "$SOURCE_IMAGE ${TARGET_REGISTRY}/${IMAGE_NAME}:${TAG} $SNAPSHOT $COMMIT"
+        }
 
         # Secrets hold the docker config under different keys
         # (.dockerconfigjson, config.json, .dockercfg), so locate it instead of
@@ -168,10 +318,25 @@ spec:
           find "$dir" -maxdepth 1 -type f -size +0 2>/dev/null | head -n1
         }
 
-        # Merge the pull and push credentials into a single auth file. A
-        # .dockercfg secret has no "auths" wrapper, so add one when missing.
+        # Turn a mounted secret into an auths object. A .dockercfg secret has no
+        # "auths" wrapper, so add one when missing, and a basic-auth secret
+        # (username/password, what the release registry secret is) names no
+        # registry at all, so it is bound to the one the image lives on.
         read_auth() {
-          local file=$1
+          local dir=$1 key=$2 registry=$3 file
+          if [[ ! -d "$dir" ]]; then
+            echo '{}'
+            return
+          fi
+          if [[ -s "$dir/username" && -s "$dir/password" ]]; then
+            jq -n --arg reg "$registry" \
+                  --arg user "$(< "$dir/username")" \
+                  --arg pass "$(< "$dir/password")" \
+              '{auths: {($reg): {username: $user, password: $pass,
+                                 auth: ($user + ":" + $pass | @base64)}}}'
+            return
+          fi
+          file=$(find_auth "$dir" "$key")
           if [[ -z "$file" ]]; then
             echo '{}'
             return
@@ -179,41 +344,114 @@ spec:
           jq -c 'if has("auths") then . else {auths: .} end' "$file"
         }
 
-        SOURCE_AUTH_FILE=$(find_auth "$SOURCE_AUTH_DIR" "$SOURCE_AUTH_KEY")
-        TARGET_AUTH_FILE=$(find_auth "$TARGET_AUTH_DIR" "$TARGET_AUTH_KEY")
-        [[ -n "$SOURCE_AUTH_FILE" ]] || echo "WARNING: no credentials mounted for the source registry"
-        [[ -n "$TARGET_AUTH_FILE" ]] || echo "WARNING: no credentials mounted for the target registry"
-
-        AUTH_FILE=/tmp/auth.json
-        jq -n \
-          --argjson src "$(read_auth "$SOURCE_AUTH_FILE")" \
-          --argjson dest "$(read_auth "$TARGET_AUTH_FILE")" \
-          '{auths: (($src.auths // {}) + ($dest.auths // {}))}' > "$AUTH_FILE"
-        echo "Registries in the merged auth file: $(jq -r '.auths | keys | join(", ")' "$AUTH_FILE")"
-
         copy_image() {
+          local src=$1 dst=$2
           if command -v skopeo > /dev/null; then
-            skopeo copy --all --authfile "$AUTH_FILE" \
-              "docker://${SOURCE_IMAGE}" "docker://${TARGET_IMAGE}"
+            skopeo copy --all --authfile "$AUTH_FILE" "docker://$src" "docker://$dst"
           else
-            oc image mirror -a "$AUTH_FILE" --keep-manifest-list \
-              "${SOURCE_IMAGE}=${TARGET_IMAGE}"
+            oc image mirror -a "$AUTH_FILE" --keep-manifest-list "$src=$dst"
           fi
         }
 
-        for attempt in 1 2 3; do
-          if copy_image; then
-            echo "Copied $SOURCE_IMAGE to $TARGET_IMAGE"
-            break
-          fi
-          if [[ "$attempt" == "3" ]]; then
-            echo "ERROR: failed to copy $SOURCE_IMAGE to $TARGET_IMAGE after $attempt attempts" >&2
-            exit 1
-          fi
-          echo "Copy failed, retrying in 30s (attempt $attempt)..."
-          sleep 30
+        # Resolve everything first, a missing artifact should not leave half of
+        # the index images copied.
+        SOURCE_IMAGES=()
+        TARGET_IMAGES=()
+        SNAPSHOTS=()
+        COMMITS=()
+        for REL in $RELEASES; do
+          echo "------------------------------------------------"
+          # Assigned, not piped, so that a resolve failure stops the task
+          PAIR=$(resolve_images "$REL")
+          read -r SRC DST SNAP SHA <<< "$PAIR"
+          echo "  source:   $SRC"
+          echo "  target:   $DST"
+          echo "  snapshot: $SNAP"
+          echo "  commit:   $SHA"
+          SOURCE_IMAGES+=("$SRC")
+          TARGET_IMAGES+=("$DST")
+          SNAPSHOTS+=("$SNAP")
+          COMMITS+=("$SHA")
         done
 
-        echo -n "$SOURCE_IMAGE" | tee $(step.results.source-image.path)
-        echo
-        echo -n "$TARGET_IMAGE" | tee $(step.results.target-image.path)
+        # brew.registry.redhat.io/rh-osbs/iib@sha256:... -> the host
+        SOURCE_HOST=${SOURCE_IMAGES[0]%%/*}
+        TARGET_HOST=${TARGET_REGISTRY%%/*}
+
+        SOURCE_AUTH=$(read_auth "$SOURCE_AUTH_DIR" "$SOURCE_AUTH_KEY" "$SOURCE_HOST")
+        TARGET_AUTH=$(read_auth "$TARGET_AUTH_DIR" "$TARGET_AUTH_KEY" "$TARGET_HOST")
+        [[ "$SOURCE_AUTH" != '{}' ]] || echo "WARNING: no credentials mounted for $SOURCE_HOST"
+        [[ "$TARGET_AUTH" != '{}' ]] || echo "WARNING: no credentials mounted for $TARGET_HOST"
+
+        AUTH_FILE=/tmp/auth.json
+        jq -n \
+          --argjson src "$SOURCE_AUTH" \
+          --argjson dest "$TARGET_AUTH" \
+          '{auths: (($src.auths // {}) + ($dest.auths // {}))}' > "$AUTH_FILE"
+        echo "Registries in the merged auth file: $(jq -r '.auths | keys | join(", ")' "$AUTH_FILE")"
+
+        FAILED=()
+        OUTCOME=()
+        for i in "${!SOURCE_IMAGES[@]}"; do
+          SRC=${SOURCE_IMAGES[$i]}
+          DST=${TARGET_IMAGES[$i]}
+          echo "------------------------------------------------"
+          echo "📦 Copying $SRC"
+          echo "        to $DST"
+          OUTCOME[$i]="failed"
+          for attempt in 1 2 3; do
+            if copy_image "$SRC" "$DST"; then
+              echo "   ✅ Copied to $DST"
+              OUTCOME[$i]="copied"
+              break
+            fi
+            if [[ "$attempt" == "3" ]]; then
+              echo "   ❌ Failed to copy $SRC after $attempt attempts" >&2
+              FAILED+=("$DST")
+              break
+            fi
+            echo "   Copy failed, retrying in 30s (attempt $attempt)..."
+            sleep 30
+          done
+        done
+
+        echo -n "${SOURCE_IMAGES[*]}" > $(step.results.source-images.path)
+        echo -n "${TARGET_IMAGES[*]}" > $(step.results.target-images.path)
+        echo -n "${SNAPSHOTS[*]}" > $(step.results.snapshots.path)
+        echo -n "${COMMITS[*]}" > $(step.results.commits.path)
+
+        # A report meant to be posted as it is in the release notification.
+        # Slack mrkdwn: *bold*, `code`, and no tables, so one line per image.
+        COPIED=$(( ${#SOURCE_IMAGES[@]} - ${#FAILED[@]} ))
+        if [[ ${#FAILED[@]} -eq 0 ]]; then
+          HEADLINE="✅ *OpenShift Pipelines $VERSION* index images are on $TARGET_HOST"
+        else
+          HEADLINE="⚠️ *OpenShift Pipelines $VERSION* index images, ${#FAILED[@]} of ${#SOURCE_IMAGES[@]} could not be copied"
+        fi
+
+        {
+          echo "$HEADLINE"
+          echo "_${ENVIRONMENT}_ · tag \`$TAG\` · $COPIED/${#SOURCE_IMAGES[@]} copied"
+          echo
+          for i in "${!TARGET_IMAGES[@]}"; do
+            DST=${TARGET_IMAGES[$i]}
+            # quay.io/openshift-pipeline/pipelines-index-4.14:1.23-stage -> 4.14
+            OCP=${DST%:*}
+            OCP=${OCP##*-}
+            [[ "${OUTCOME[$i]}" == "copied" ]] && ICON="✅" || ICON="❌"
+            printf '%s OCP %-5s `%s`\n' "$ICON" "$OCP" "$DST"
+            printf '     ↳ snapshot `%s` @ `%s`\n' "${SNAPSHOTS[$i]}" "${COMMITS[$i]:0:7}"
+          done
+          echo
+          echo "Pull one with \`podman pull ${TARGET_IMAGES[0]}\`"
+        } > /tmp/summary.md
+
+        echo "================================================"
+        cat /tmp/summary.md
+        echo "================================================"
+        cp /tmp/summary.md $(step.results.summary.path)
+
+        if [[ ${#FAILED[@]} -gt 0 ]]; then
+          echo "❌ ${#FAILED[@]} of ${#SOURCE_IMAGES[@]} image(s) could not be copied: ${FAILED[*]}" >&2
+          exit 1
+        fi
