@@ -10,6 +10,20 @@ spec:
       type: string
     - name: ENVIRONMENT
       type: string
+    - name: RELEASE_PLAN
+      type: string
+      default: ""
+      description: >-
+        Release plan to use. Resolved from APPLICATION and ENVIRONMENT when
+        empty, as <application>-<environment>-rp.
+    - name: SNAPSHOTS
+      type: array
+      default: []
+      description: >-
+        Snapshots to release. The one belonging to APPLICATION is picked out of
+        the list by its application label, so the snapshots of a whole release
+        can be handed to every release task. The latest push snapshot of the
+        application is used when the list holds none of it.
   results:
     - name: application
       description: The release plan name
@@ -33,6 +47,8 @@ spec:
         value: $(params.ENVIRONMENT)
       - name: VERSION
         value: $(params.VERSION)
+      - name: RELEASE_PLAN
+        value: $(params.RELEASE_PLAN)
   steps:
     - name: get-application
       results:
@@ -54,18 +70,56 @@ spec:
         - name: APPLICATION
           value: $(steps.get-application.results.application)
       script: |
-        
-        
+        #!/usr/bin/env bash
+        set -euo pipefail
+
         echo "APPLICATION : $APPLICATION"
-        
-        VERSION_PLAN=$(oc get releaseplan -o json | jq -r --arg APP $APPLICATION --arg ENVX $ENVIRONMENT '
+
+        # Explicitly named, used as is after checking it belongs to the application
+        if [[ -n "$RELEASE_PLAN" ]]; then
+          PLAN_APP=$(oc get releaseplan "$RELEASE_PLAN" -o jsonpath='{.spec.application}' 2>/dev/null || true)
+          if [[ -z "$PLAN_APP" ]]; then
+            echo "ERROR: release plan $RELEASE_PLAN not found" >&2
+            exit 1
+          fi
+          if [[ "$PLAN_APP" != "$APPLICATION" ]]; then
+            echo "ERROR: release plan $RELEASE_PLAN targets $PLAN_APP, not $APPLICATION" >&2
+            exit 1
+          fi
+          echo "Using the release plan passed in: $RELEASE_PLAN"
+          echo -n "$RELEASE_PLAN" | tee $(step.results.release-plan.path)
+          exit 0
+        fi
+
+        # Every plan follows <application>-<environment>-rp. Match it exactly,
+        # a substring match on the environment also catches the neighbouring
+        # plans, "prod" is in openshift-pipelines-1-24-core-cdn-prod-rp too,
+        # and which one wins then only depends on the sort order.
+        EXACT="${APPLICATION}-${ENVIRONMENT}-rp"
+        if [[ "$(oc get releaseplan "$EXACT" -o jsonpath='{.spec.application}' 2>/dev/null || true)" == "$APPLICATION" ]]; then
+          echo "Release plan: $EXACT"
+          echo -n "$EXACT" | tee $(step.results.release-plan.path)
+          exit 0
+        fi
+
+        # Nothing under that name, fall back to the substring match
+        CANDIDATES=$(oc get releaseplan -o json | jq -r --arg APP "$APPLICATION" --arg ENVX "$ENVIRONMENT" '
           [
            .items[]
            | select(.spec.application == $APP and (.metadata.name | contains($ENVX)))
            |.metadata.name
-          ]
-          |.[-1]'
+          ] | .[]'
         )
+        if [[ -z "$CANDIDATES" ]]; then
+          echo "ERROR: no release plan of $APPLICATION targets '$ENVIRONMENT'" >&2
+          exit 1
+        fi
+        if [[ $(wc -l <<< "$CANDIDATES") -gt 1 ]]; then
+          echo "⚠️  $EXACT does not exist and several plans match '$ENVIRONMENT':"
+          sed 's/^/     /' <<< "$CANDIDATES"
+          echo "   Taking the last one, pass RELEASE_PLAN to choose."
+        fi
+        VERSION_PLAN=$(tail -n1 <<< "$CANDIDATES")
         echo -n "$VERSION_PLAN" | tee $(step.results.release-plan.path)
 
     - name: get-snapshot
@@ -74,12 +128,43 @@ spec:
       env:
         - name: APPLICATION
           value: $(steps.get-application.results.application)
+      # An array param can only be expanded into args, "$@" below is the list
+      args:
+        - $(params.SNAPSHOTS[*])
       script: |
+        #!/usr/bin/env bash
+        # A snapshot carries the application it was built for as a label, so the
+        # snapshots of core, bundle and index can be passed together and each
+        # release task takes its own instead of the caller sorting them out.
+        for SNAPSHOT in "$@"; do
+          SNAPSHOT_APP=$(kubectl get snapshot "$SNAPSHOT" \
+            -o jsonpath='{.metadata.labels.appstudio\.openshift\.io/application}' 2>/dev/null)
+          if [[ -z "$SNAPSHOT_APP" ]]; then
+            echo "WARNING: snapshot $SNAPSHOT not found, ignoring it"
+            continue
+          fi
+          echo "$SNAPSHOT belongs to $SNAPSHOT_APP"
+          if [[ "$SNAPSHOT_APP" == "$APPLICATION" ]]; then
+            echo "Releasing the snapshot passed in: $SNAPSHOT"
+            echo -n "$SNAPSHOT" | tee $(step.results.snapshot.path)
+            exit 0
+          fi
+        done
+
+        if [[ $# -gt 0 ]]; then
+          echo "None of the $# snapshot(s) passed in belongs to $APPLICATION, taking the latest one"
+        fi
+
         LATEST_SNAPSHOT=$(
         kubectl get snapshots \
           -l "pac.test.appstudio.openshift.io/event-type=push,appstudio.openshift.io/application=${APPLICATION}" \
           --sort-by=.metadata.creationTimestamp \
           -o jsonpath='{.items[*].metadata.name}' | awk '{print $NF}')
+
+        if [[ -z "$LATEST_SNAPSHOT" ]]; then
+          echo "ERROR: no push snapshot found for $APPLICATION" >&2
+          exit 1
+        fi
 
         echo -n "$LATEST_SNAPSHOT" | tee $(step.results.snapshot.path)
 

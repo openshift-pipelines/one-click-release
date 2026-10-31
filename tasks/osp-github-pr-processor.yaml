@@ -107,6 +107,7 @@ spec:
         
         STATUS_CODE_FAILED=101
         STATUS_CODE_PENDING=102
+        STATUS_CODE_SKIPPED=103
         STATUS_CODE_SUCCESS=200
 
         # Why a PR could not be merged, reported in the final summary
@@ -160,11 +161,26 @@ spec:
         function process_pr() {
           URL=$1
           echo "Processing PR $URL"
-          PR_DATA=$(gh pr view "$URL" --json mergeable,mergeStateStatus)
+          PR_DATA=$(gh pr view "$URL" --json state,mergeable,mergeStateStatus)
+          PR_STATE=$(echo "$PR_DATA" | jq -r '.state')
           MERGEABLE=$(echo "$PR_DATA" | jq -r '.mergeable')
           MERGE_STATE=$(echo "$PR_DATA" | jq -r '.mergeStateStatus')
-          REPO_NAME=$(echo "$URL" | cut -d'/' -f4,5) 
-        
+          REPO_NAME=$(echo "$URL" | cut -d'/' -f4,5)
+
+            # --- SCENARIO 0: PR IS NO LONGER OPEN ---
+            # The auto merge enabled on a previous round can land the PR on its
+            # own, and a PR closed in the meantime is not ours to reopen.
+            if [[ "$PR_STATE" == "MERGED" ]]; then
+              echo "✅ PR is already merged, nothing left to do."
+              unset "FAILURE_REASON[$URL]"
+              return $STATUS_CODE_SUCCESS
+            fi
+            if [[ "$PR_STATE" == "CLOSED" ]]; then
+              echo "⏭️  SKIP: PR was closed without being merged."
+              unset "FAILURE_REASON[$URL]"
+              return $STATUS_CODE_SKIPPED
+            fi
+
             # --- SCENARIO 1: MERGE CONFLICTS ---
             if [[ "$MERGEABLE" == "CONFLICTING" || "$MERGE_STATE" == "DIRTY" ]]; then
               echo "⚠️ SKIP: PR has merge conflicts."
@@ -234,6 +250,7 @@ spec:
               return $STATUS_CODE_FAILED
             fi
             echo "$MERGE_OUTPUT"
+            unset "FAILURE_REASON[$URL]"
             return $STATUS_CODE_SUCCESS
         }
         
@@ -261,7 +278,8 @@ spec:
           declare -a FAILING_PRS=()
           declare -a SUCCESS_PRS=()
           declare -a PENDING_PRS=()
-        
+          declare -a SKIPPED_PRS=()
+
           while read -r URL; do
             echo "------------------------------------------------"
             echo "🚀 Processing PR: $URL"
@@ -271,6 +289,7 @@ spec:
             case $STATUS in
               $STATUS_CODE_FAILED) FAILING_PRS+=("$URL") ;;
               $STATUS_CODE_PENDING) PENDING_PRS+=("$URL") ;;
+              $STATUS_CODE_SKIPPED) SKIPPED_PRS+=("$URL") ;;
               $STATUS_CODE_SUCCESS) SUCCESS_PRS+=("$URL") ;;
             esac
           done < extracted_prs.txt
@@ -304,6 +323,7 @@ spec:
                 case $STATUS in
                   $STATUS_CODE_FAILED) FAILING_PRS+=("$URL") ;;
                   $STATUS_CODE_PENDING) STILL_PENDING_PRS+=("$URL") ;;
+                  $STATUS_CODE_SKIPPED) SKIPPED_PRS+=("$URL") ;;
                   $STATUS_CODE_SUCCESS) SUCCESS_PRS+=("$URL") ;;
                 esac
               done
@@ -322,6 +342,9 @@ spec:
           echo "================================================"
           echo "✅ Successful PRs: ${SUCCESS_PRS[*]}"
           echo "❌ Failed PRs:     ${FAILING_PRS[*]}"
+          if [[ ${#SKIPPED_PRS[@]} -gt 0 ]]; then
+            echo "⏭️  Skipped PRs:    ${SKIPPED_PRS[*]} (closed without being merged)"
+          fi
           if [[ ${#PENDING_PRS[@]} -gt 0 ]]; then
             echo "⏳ Pending PRs:    ${PENDING_PRS[*]}"
           fi
