@@ -1,0 +1,160 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: release-summary-task
+spec:
+  description: >-
+    Reports what a release actually put out: every snapshot released to the
+    environment, the operator commit they were built from, and, on stage, the
+    index images mirrored to Quay.
+
+    It reads the state off the cluster rather than off the results of the
+    release tasks, so that it also works for a run that starts at POST-RELEASE,
+    where those tasks are skipped and a task consuming their results would be
+    skipped with them.
+  params:
+    - name: VERSION
+      type: string
+      description: "Minor version being released, e.g. 1.24"
+    - name: ENVIRONMENT
+      type: string
+      default: "stage"
+      description: "Environment the releases were made to, stage or prod"
+    - name: TARGET_REGISTRY
+      type: string
+      default: "quay.io/openshift-pipeline"
+      description: "Registry the index images were mirrored to, reported on stage"
+    - name: TARGET_TAG
+      type: string
+      default: ""
+      description: "Overrides the computed <VERSION>-<ENVIRONMENT> tag of the index images"
+  results:
+    - name: summary
+      description: >-
+        Human readable report of the release, in Slack mrkdwn, ready to be
+        posted in the release notification
+      value: $(steps.summarise.results.summary)
+    - name: snapshots
+      description: Space separated snapshots released to the environment
+      value: $(steps.summarise.results.snapshots)
+    - name: commit
+      description: Operator commit the release was built from
+      value: $(steps.summarise.results.commit)
+  stepTemplate:
+    image: quay.io/openshift-pipeline/ci
+    env:
+      - name: VERSION
+        value: $(params.VERSION)
+      - name: ENVIRONMENT
+        value: $(params.ENVIRONMENT)
+      - name: TARGET_REGISTRY
+        value: $(params.TARGET_REGISTRY)
+      - name: TARGET_TAG
+        value: $(params.TARGET_TAG)
+  steps:
+    - name: summarise
+      results:
+        - name: summary
+        - name: snapshots
+        - name: commit
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        TAG="$TARGET_TAG"
+        [[ -n "$TAG" ]] || TAG="${VERSION}-${ENVIRONMENT}"
+        DASHED="${VERSION//./-}"
+
+        echo "Collecting the $ENVIRONMENT releases of $VERSION"
+
+        # Read each collection once, the namespace holds thousands of releases
+        APPS_JSON=$(oc get application -o json)
+        PLANS_JSON=$(oc get releaseplan -o json)
+        RELEASES_JSON=$(oc get releases -o json)
+
+        APPS=$(jq -r --arg V "$DASHED" '
+          [ .items[].metadata.name | select(contains("-" + $V)) ] | sort | .[]' <<< "$APPS_JSON")
+
+        if [[ -z "$APPS" ]]; then
+          echo "ERROR: no application found for $VERSION" >&2
+          exit 1
+        fi
+
+        # <kind>\t<application>\t<snapshot>\t<completion>, one per released application
+        ROWS=/tmp/rows.tsv
+        : > "$ROWS"
+        SNAPSHOTS=()
+        while read -r APP; do
+          [[ -n "$APP" ]] || continue
+          PLANS=$(jq -c --arg APP "$APP" --arg ENVX "$ENVIRONMENT" '
+            [ .items[] | select(.spec.application == $APP and (.metadata.name | contains($ENVX))) | .metadata.name ]' <<< "$PLANS_JSON")
+          [[ "$PLANS" != "[]" ]] || continue
+
+          REL=$(jq -r --argjson PLANS "$PLANS" '
+            [ .items[]
+              | select(.spec.releasePlan | IN($PLANS[]))
+              | select(any(.status.conditions[]?; .type == "Released" and .status == "True")) ]
+            | sort_by(.status.completionTime // .metadata.creationTimestamp)
+            | last' <<< "$RELEASES_JSON")
+          [[ "$REL" != "null" ]] || continue
+
+          SNAP=$(jq -r '.spec.snapshot' <<< "$REL")
+          DONE=$(jq -r '.status.completionTime // .metadata.creationTimestamp' <<< "$REL")
+
+          # core / bundle / index-4-14 ...
+          KIND=$(sed -E 's/^openshift-pipelines-//; s/-'"$DASHED"'$//' <<< "$APP")
+          printf '%s\t%s\t%s\t%s\n' "$KIND" "$APP" "$SNAP" "$DONE" >> "$ROWS"
+          SNAPSHOTS+=("$SNAP")
+        done <<< "$APPS"
+
+        if [[ ! -s "$ROWS" ]]; then
+          echo "ERROR: no $ENVIRONMENT release found for $VERSION" >&2
+          exit 1
+        fi
+
+        # The operator commit every snapshot is built from. Taken from the
+        # bundle when there is one, it is the one that carries the CSV.
+        COMMIT=""
+        for PREFERRED in bundle core; do
+          SNAP=$(awk -F'\t' -v k="$PREFERRED" '$1 == k {print $3}' "$ROWS" | head -n1)
+          [[ -n "$SNAP" ]] || continue
+          COMMIT=$(oc get snapshot "$SNAP" -o jsonpath='{.spec.components[0].source.git.revision}' 2>/dev/null || true)
+          [[ -z "$COMMIT" ]] || break
+        done
+        [[ -n "$COMMIT" ]] || COMMIT="unknown"
+
+        # ==========================================
+        # THE REPORT
+        # ==========================================
+        {
+          echo "🚀 *OpenShift Pipelines $VERSION* released to *$ENVIRONMENT*"
+          echo "operator \`${COMMIT:0:7}\` · $(wc -l < "$ROWS" | tr -d ' ') application(s)"
+          echo
+          echo "*Snapshots released*"
+          while IFS=$'\t' read -r kind app snap done_at; do
+            printf '• %-14s `%s`  _%s_\n' "$kind" "$snap" "${done_at%T*} ${done_at#*T}"
+          done < "$ROWS"
+
+          if [[ "$ENVIRONMENT" == "stage" ]]; then
+            echo
+            echo "*Index images*"
+            FOUND=0
+            while IFS=$'\t' read -r kind app snap done_at; do
+              case "$kind" in index-*) ;; *) continue ;; esac
+              # index-4-14 -> 4.14
+              OCP=${kind#index-}
+              OCP=${OCP//-/.}
+              echo "• OCP $OCP  \`${TARGET_REGISTRY}/pipelines-index-${OCP}:${TAG}\`"
+              FOUND=$((FOUND + 1))
+            done < "$ROWS"
+            [[ "$FOUND" -gt 0 ]] || echo "• none, no index application was released"
+          fi
+        } > /tmp/summary.md
+
+        echo "================================================"
+        cat /tmp/summary.md
+        echo "================================================"
+
+        cp /tmp/summary.md $(step.results.summary.path)
+        echo -n "${SNAPSHOTS[*]}" > $(step.results.snapshots.path)
+        echo -n "$COMMIT" > $(step.results.commit.path)

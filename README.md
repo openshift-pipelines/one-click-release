@@ -58,7 +58,7 @@ All these steps should be completed in a single click.
 
 ##  Stage/Production Release Steps
 
-* Update CSV with latest core snapshot
+* Update CSV with latest core snapshot/
 * Build Bundle
 * Update OLM with latest bundle snapshot
 * Render OLM

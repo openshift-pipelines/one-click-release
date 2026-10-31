@@ -4,10 +4,10 @@ metadata:
   name: release-config-task
 spec:
   params:
-    - name: RELEASE
+    - name: VERSION
       type: string
-    - name: RELEASE_ACTION
-      default: ""
+    - name: NEW_PATCH
+      default: "false"
     - name: DRY_RUN
       default: "false"
     - name: REPO_URL
@@ -16,11 +16,8 @@ spec:
       default: main
     - name: github-token-secret
       type: string
-      default: "github"
-      description: "Name of the secret containing the GitHub token"
     - name: github-token-key
       type: string
-      default: "github-token"
   volumes:
     - name: github-secret-volume
       secret:
@@ -29,11 +26,11 @@ spec:
       emptyDir: { }
   results:
     - name: release-plan
-      description: The release plan name
+      description: The VERSION plan name
     - name: snapshot
       description: The snapshot name
-    - name: release
-      description: The created release name
+    - name: VERSION
+      description: The created VERSION name
   stepTemplate:
     workingDir: $(workspaces.source.path)/
     image: quay.io/openshift-pipeline/ci:latest
@@ -47,8 +44,8 @@ spec:
     env:
       - name: HOME
         value: /shared-bin
-      - name: RELEASE
-        value: $(params.RELEASE)
+      - name: VERSION
+        value: $(params.VERSION)
       - name: BIN_DIR
         value: /shared-bin
       - name: PATH
@@ -90,22 +87,18 @@ spec:
         set -x
         git clone -b $(params.REVISION) $(params.REPO_URL) repo
 
-    - name: new-release-action
-      env:
-        - name: RELEASE_ACTION
-          value: $(params.RELEASE_ACTION)
+    - name: create-new-patch
       when:
-        - input: $(params.RELEASE_ACTION)
+        - input: $(params.NEW_PATCH)
           operator: in
           values:
-            - "new-release"
-            - "new-patch"
+            - "true"
       script: |
         set -x
         cd repo
         ./hack/release-manager.sh \
-        --action "$RELEASE_ACTION" \
-        --version "$RELEASE" 
+        --action "new-patch" \
+        --version "$VERSION" 
 
 
     - name: generate-konflux-config
@@ -117,40 +110,59 @@ spec:
       script: |
         gh auth setup-git
         cd repo
-        go run ./cmd/konflux --version=$RELEASE --dry-run=$(params.DRY_RUN)
+        rm -rf .konflux/openshift-pipelines/${VERSION//./-} 
+        go run ./cmd/konflux --version=$VERSION --dry-run=$(params.DRY_RUN) --generate-tekton=false
 
-    - name: commit-new-changes
-      #      when:
-      #        input: $(params.DRY_RUN)
-      #        operator: in
-      #        value: false
+#    - name: commit-new-changes
+#      when:
+#        - input: $(params.DRY_RUN)
+#          operator: in
+#          values:
+#            - "false"
+#      script: |
+#        # 1. Set the Git identity for this workspace
+#        cd repo
+#        gh auth setup-git
+#        git config user.email "pipeline-bot@redhat.com"
+#        git config user.name "Tekton Pipeline Bot"
+#        BASE_BRANCH=$(git branch --show-current)
+#        SOURCE_BRANCH=one-click-release/$VERSION/update-konflux-config
+#        git checkout -b ${SOURCE_BRANCH}
+#        git add -f .konflux config
+#
+#        if [[ -z $(git status --porcelain --untracked-files=no) ]]; then
+#          echo "No change, exiting"
+#          exit 0
+#        fi
+#
+#        git commit -F- <<EOF
+#          [bot:$VERSION] Update Generated Konflux Config
+#        EOF
+#
+#        git push -f origin ${SOURCE_BRANCH}
+#        set -x
+#        if [ "$(gh pr list --base ${BASE_BRANCH} --head ${SOURCE_BRANCH} --json url --jq 'length')" = "0" ]; then
+#          echo "creating PR..."
+#          gh pr create -B ${BASE_BRANCH} -H ${SOURCE_BRANCH} --label=automated --label=hack   --fill
+#        else
+#          echo "PR already exists: $(gh pr list --base ${BASE_BRANCH} --head ${SOURCE_BRANCH} --json url --jq .[].url)"
+#        fi
+    - name: apply-konflux-configuration
+      script: |
+        kubectl apply -Rf  ./repo/.konflux/openshift-pipelines/${VERSION/./-} || true
+    - name: generate-tekton-config
+      when:
+        - input: $(params.NEW_PATCH)
+          operator: in
+          values:
+            - "true"
+      env:
+        - name: GOCACHE
+          value: $(workspaces.source.path)/.cache
       script: |
         gh auth setup-git
         cd repo
-        BASE_BRANCH=${GITHUB_REF#refs/heads/}
-        SOURCE_BRANCH=relase/$RELEASE/hack-update-konflux-config
-        git checkout -b ${SOURCE_BRANCH}
-        git add -f .konflux
-
-        if [[ -z $(git status --porcelain --untracked-files=no) ]]; then
-          echo "No change, exiting"
-          exit 0
-        fi
-
-        git commit -F- <<EOF
-          [bot:$RELEASE] Update Generated Konflux Config
-        EOF
-
-        git push -f origin ${SOURCE_BRANCH}
-
-        if [ "$(gh pr list --base ${BASE_BRANCH} --head ${SOURCE_BRANCH} --json url --jq 'length')" = "0" ]; then
-          echo "creating PR..."
-          gh pr create -B ${BASE_BRANCH} -H ${SOURCE_BRANCH} --label=automated --label=hack   --fill
-        fi
-    - name: apply-konflux-configuration
-      script: |
-        kubectl apply -Rf  ./repo/.konflux/openshift-pipelines/${RELEASE/./-}
-
+        go run ./cmd/konflux --version=$VERSION --dry-run=$(params.DRY_RUN) --generate-tekton=true
 
   workspaces:
     - name: source
